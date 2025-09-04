@@ -1,0 +1,1559 @@
+---
+title: "Telomere_Red_analysis"
+output: html_document
+author: "Ting Zhai"
+---
+
+**Analysis script for manuscript ""Telomere Length Dynamics As a Biomarker of Individual Radiation Sensitivity and Pneumonitis in Lung Cancer Patients Receiving Thoracic Radiotherapy"**
+
+# Set up and load data
+
+## Setup environment
+
+```{r setup}
+library(tidyverse)
+library(psych)
+library(corrplot)
+library(lmerTest)
+library(ggsignif)
+library(scales)
+
+# load formats and pre-defined helper functions
+ path_R <- "Scripts/Customized_R_files/"
+
+files <- list.files(path_R, pattern = "\\.R$", full.names = TRUE)
+sapply(files, source) #load all R files in path_R 
+
+# define the path
+ path_data = 'Data/cleaned_rdat/'
+ path_figure = 'Analysis_intermediate_files/telomere/'
+
+```
+
+
+## Load data
+
+```{r load-data}
+sample_info <- readRDS(paste0(path_data, 'sample_info_11062024.rds')) 
+pheno <- readRDS(paste0(path_data, "pheno_06062025.rds")) 
+
+# create updated patient variables in pheno for downstream analysis 
+pheno <- pheno %>%
+  mutate(
+    Smoking_ever = factor(ifelse(Smoking == "Never", "Never", "Ever"), levels = c("Never", "Ever")),
+    CancerStage_combined = ifelse(CancerStage %in% c("Early stage", "Locally advanced"), "Local", "Metastatic"),
+    Smoking = factor(Smoking, levels = c("Never", "Former", "Current")),
+    Sex = factor(Sex, levels = c("Male", "Female")),
+    PostMonth_upt = replace_na(PostMonth_upt, 0),
+    RT_dosage = RT_dosage / 100,
+    BBID = as.character(BBID)
+  )
+
+#add newly extracted lung v20 upon editor request
+v20 <- readxl::read_excel("V20.xlsx") %>% mutate(BBID=as.character(BBID))
+
+# long-format data for case only: dat3
+dat3 <- readRDS(paste0(path_data, '3.FMHCR_batch_corrected_n265.rds')) %>%
+  inner_join(sample_info, by = 'SampleID') %>%
+  #mutate(BBID = as.character(BBID)) %>% # ensure BBID is character for merging)
+  filter(week_num < 60 & Status != "During") %>%
+  left_join(pheno, by = "BBID", suffix = c("", ".y")) %>%
+  dplyr::select(-contains(".y")) %>%
+  left_join(v20[,c("BBID","V20")], by = "BBID") %>%
+  mutate(
+    Status = ifelse(BBID == "14778" & Status == "", "Baseline", Status), #one pt with canceled RT but collected at two points
+    PostMonth_upt = ifelse(Status == "Baseline", 0, PostMonth_upt),
+        PostMonth_upt = replace_na(PostMonth_upt, 0),
+    PostMonth_group = cut(PostMonth_upt, breaks = c(-Inf, 0, 1, 3, 6, 12, Inf), labels = c("-", "1", "1-3", "3-6", "6-12", ">12")), 
+    Smoking = factor(Smoking, levels = c("Never", "Former", "Current")),
+    Sex = factor(Sex, levels = c("Male", "Female"))) %>%
+  arrange(BBID) %>%
+  filter(BBID != "11940") # remove the patient with RT to liver BBID 11940
+
+# wide-format data for case only: dat4
+dat4 <- readRDS(paste0(path_data, '4.FMHCR_wide_n100_imp.rds')) %>% #4.FMHCR_wide_n100_imp 4.FMHCR_wide_n101.rds
+  mutate(BBID=as.character(BBID)) %>%
+  left_join(pheno, by = "BBID", suffix = c("", ".y")) %>% dplyr::select(-contains(".y")) %>%
+  left_join(v20[,c("BBID","V20")], by = "BBID") %>%
+  filter(BBID != "11940")
+```
+
+
+# Patient characteristics
+
+## Table 1
+
+```{r}
+# Table 1 
+library(tableone)
+table1_vars <- c("Age", "Sex", "Race", "Smoking","Multiprim", "CancerType", "CancerStage", "RT_group", "RT_dosage", "RT_fraction",  "V20","Chemorad", "Rad_prior", "Prior_immuno", "Prior_chemo", "Prior_targeted", "telomere_Baseline")  
+table1_cat_vars <- c("Sex", "Race", "Smoking", "Multiprim", "CancerType", "CancerStage", "RT_group", "Chemorad", "Rad_prior", "Prior_immuno", "Prior_chemo", "Prior_targeted")
+#table1 <- CreateTableOne(vars = table1_vars, strata= "RT_group", data = dat4, factorVars = table1_cat_vars)
+table1 <- CreateTableOne(vars = table1_vars, data = dat4, factorVars = table1_cat_vars)
+print(table1, nonnormal = table1_vars, showAllLevels = TRUE)
+
+# Summary of telomere length
+dat4 %>% group_by(CancerStage) %>% summarise(mean = mean(telomere_Baseline,na.rm=T), sd = sd(telomere_Baseline,na.rm=T), n = n())
+```
+
+
+# Main analysis
+
+## QC
+
+### Covariates correlation
+
+```{r}
+# check pairwise correlations/associations
+library(GGally)
+table1_vars <- c("Age", "Sex", "Smoking", "CancerStage", "RT_group", "Chemorad", 
+                 "RT_dosage", "RT_fraction", "V20", 
+                 "Lymphocytes_perc_diff", "Neutrophils_perc_diff", "PostMonth_upt", "Rad_prior"
+                 )
+
+pm <- ggpairs(dat4, columns = table1_vars)
+
+ggsave(paste0(path_figure,"pairwise_correlation.svg"), pm, width = 12, height = 12)
+```
+
+
+## Baseline
+
+### Regression
+
+Generate scaled continuous variable for effect sizes to outpput and visualize in forestplot.  
+
+```{r}
+# glm - use dat3 with the tel_batch indicator
+bs <- dat3 %>% filter(Status == "Baseline", SampleID !="P4P") %>% #remove the sample whose RT was canceled 
+  mutate(log_tl = log(telomere),
+          age_scaled = as.numeric(scale(Age)), 
+         WBC_scaled = as.numeric(scale(WBC)),
+         lymph_perc_scaled = as.numeric(scale(Lymphocytes_perc)),
+         neutro_perc_scaled = as.numeric(scale(Neutrophils_perc)),
+         NLR = as.numeric(scale(Neutrophils_perc/Lymphocytes_perc)),
+         MLR = as.numeric(scale(Monocytes_perc/Lymphocytes_perc)) )
+
+# telomere length by cancer stage
+summary( glm( log(telomere) ~ Age + Sex + Smoking + as.numeric(CancerStage) + Neutrophils_perc + Lymphocytes_perc + tel_batch, data = bs) )
+summary( glm( log(telomere) ~ Age + Sex + Smoking + Neutrophils_perc + Lymphocytes_perc + tel_batch, data = bs[bs$CancerStage %in% c("Oligomet","Widely met"),]) )
+
+# use pre-defined loop 
+
+var_pred <- c("age_scaled", "Sex", "Smoking",  "CancerStage", #"CancerType",
+              "Rad_prior", "Prior_chemo", "Prior_immuno", "Prior_targeted", #"NLR", "MLR","WBC_scaled", 
+              "neutro_perc_scaled", "lymph_perc_scaled", "tel_batch")
+
+var_pred <- c("age_scaled", "Sex", "Smoking", "CancerStage", "neutro_perc_scaled", "lymph_perc_scaled", "tel_batch")
+
+results <- loop_glm(outcomes = c("log_tl"), predictors = var_pred, data = bs, all_together = T) %>% mutate(
+  beta = exp(Coefficient),
+  lower = exp(Coefficient - 1.96 * SE),
+  upper = exp(Coefficient + 1.96 * SE) )
+results
+write.csv(results, file=paste0(path_figure, "temp.csv"))
+```
+
+
+## RT-change
+
+### LMER 
+
+```{r lmer-tl}
+# MAIN RESULTS
+# generate estimates and process in excel for forest plot
+
+# based on reviewers' feedback, we will do an overall analysis and explore further in Radical group
+
+data <- dat3 %>% left_join(v20[,c("BBID","V20")], by = "BBID") %>% # add v20 to the data
+  filter(Status !="During" ) %>% # remove the during RT samples
+  mutate(log_tl = log(telomere), 
+         Age_60 = factor(ifelse(Age > 60, "Age>60yr", "Age<=60yr"), levels = c("Age<=60yr", "Age>60yr")) )
+
+tech_vars <- c("Neutrophils_perc", "Lymphocytes_perc", "tel_batch" )
+adj_vars <- c("Age_60", "Sex", "Smoking", "RT_group", "RT_dosage", "RT_fraction", "Neutrophils_perc", "Lymphocytes_perc", "tel_batch")
+# avoid chemorad which only differs in radical, and v20 colinear with RT_group in the overall model 
+
+# overall
+loop_lmer_status(var_outcome = c("log_tl"), data = data, additional_covariates = tech_vars) # crude - no covar
+loop_lmer_status(var_outcome = c("log_tl"), data = data, additional_covariates = adj_vars) # all adj vars
+
+loop_lmer_status(var_outcome = c("log_tl"), data = data, 
+    additional_covariates = c("Age", "Sex","Smoking", "RT_dosage", "RT_fraction", "Neutrophils_perc", "Lymphocytes_perc", "tel_batch"),
+    subset_var = c("RT_group"))
+
+# Radical group
+sample_info$BBID <- as.numeric(sample_info$BBID)
+data <- dat3 %>% 
+ # left_join(sample_info[sample_info$week_num<60, c("BBID", "Status","tel_batch")], by = c("BBID","Status")) %>%
+  filter(Status !="During" & RT_group =="Radical") %>% 
+  mutate(log_tl = log(telomere), 
+         Age_67 = factor(ifelse(Age >= 67, "Age>=67yr", "Age<67yr")),
+         v20_bin = ifelse(V20 >= 0.23, "high", "low"), 
+         v20_tertile = cut(V20, breaks = c(-Inf, 0.1691, 0.2763, Inf), labels = c("Q1", "Q2-3", "Q4")),
+         Dose_bin = ifelse(RT_dosage >= 60, ">=60Gy", "<60Gy"),
+         Dose_3 = case_when( RT_dosage < 60 ~ "1",
+            RT_dosage == 60 ~ "2",
+           RT_dosage > 60 ~ "3"),
+         Frac_bin = ifelse(RT_fraction >= 30, ">=30", "<30"), 
+         Frac_3 = case_when( RT_fraction < 30 ~ "1",
+           RT_fraction == 30 ~ "2",
+           RT_fraction > 30 ~ "3"),
+         Stage_3 = case_when( CancerStage == "Early stage" ~ "1",
+           CancerStage == "Locally advanced" ~ "2",
+           CancerStage %in% c("Oligomet","Widely met") ~ "3")
+         )
+
+# SBRT
+data <- dat3 %>% filter(Status !="During" & RT_group =="SBRT") %>% 
+  mutate(log_tl = log(telomere),
+         Age_65 = factor(ifelse(Age >= 65, "Age>=65yr", "Age<65yr")),
+         v20_bin = ifelse(V20 >= 0.05, "high", "low") )
+         
+
+loop_lmer(var_outcome = c("log_tl"), data = data, additional_covariates = NULL) # crude - no covar
+loop_lmer_status(var_outcome = c("log_tl"), data = data, additional_covariates = adj_vars) # all adj vars
+loop_lmer_status(var_outcome = c("log_tl"), data = data, additional_covariates = c("Neutrophils_perc", "Lymphocytes_perc", "tel_batch")) # all adj vars
+
+
+loop_lmer_status(var_outcome = c("log_tl"), data = data, 
+    additional_covariates =  c("Age", "Sex", "Smoking_ever", "V20","RT_dosage", "RT_fraction", "Neutrophils_perc", "Lymphocytes_perc", "tel_batch"),
+    subset_var = )
+
+loop_lmer_status(var_outcome = c("log_tl"), data = data, 
+    additional_covariates = c("Age", "Sex", "Smoking", "Chemorad", "Frac_3", "Dose_3", #"CancerStage_combined",
+                             "Neutrophils_perc", "Lymphocytes_perc", "tel_batch" ),
+    subset_var = "CancerStage_combined")
+
+loop_lmer_status(var_outcome = c("log_tl"), data = data, 
+    additional_covariates = tech_vars,
+    subset_var = c("Age_65", "Sex", "Smoking_ever", "v20_bin", "CancerStage_combined")
+      )
+```
+
+
+```{r generate-imputed}
+library(tidyverse)
+# incorporate imputed data with sample_info and generate long data similar to dat3 
+sample_info <- readRDS(paste0(path, "sample_info_09242024.rds")) #read in the data without CBC
+
+imputed_datasets = readRDS(paste0(path_data, 'CBC_imputed_datasets_12032024.rds'))
+m=20
+for (i in 1:m) {
+  imputed_datasets[[i]] <- imputed_datasets[[i]] %>% 
+     mutate(Sample = ifelse(Sample == "RO13292_P01a_L1PB_1", "RO13292_P01b_L1PB_1", Sample)) %>% # Sample coded incorrectly for H2P!!!
+    dplyr::select(BBID, Sample, CBC_visit, WBC, Neutrophilsabs, Lymphocytesabs, Monocytesabs, Eosinophilsabs, Basophilsabs, CellCount) %>% 
+    mutate(BBID = as.character(BBID), Neutro_perc = 100*Neutrophilsabs/WBC, Lympho_perc = 100*Lymphocytesabs/WBC, Monocytes_perc = 100*Monocytesabs/WBC, Eosino_perc = 100*Eosinophilsabs/WBC, Baso_perc = 100*Basophilsabs/WBC) %>% as.data.frame()
+
+  imputed_datasets[[i]] <- sample_info %>%
+    inner_join(imputed_datasets[[i]], by = c("BBID", "Sample")) %>%
+    inner_join(readRDS(paste0(path_data, '3.FMHCR_batch_corrected_n265.rds')), by = "SampleID") %>% 
+    filter(week_num < 60 & Status != "During") %>%
+    left_join(pheno, by = "BBID", suffix = c("", ".y")) %>%
+     dplyr::select(-contains(".y")) %>%
+     left_join(v20[,c("BBID","V20")], by = "BBID") %>%
+    mutate(
+      log_tl = log(telomere),
+      Age_scaled = as.numeric(scale(Age)),
+      Neutro_perc_scaled = as.numeric(scale(Neutro_perc)),
+      Lympho_perc_scaled = as.numeric(scale(Lympho_perc)), 
+      Status = ifelse(BBID == "14778" & Status == "", "Baseline", Status),
+      PostMonth_upt = ifelse(Status == "Baseline", 0, PostMonth_upt),
+      Smoking = factor(Smoking, levels = c("Never", "Former", "Current")),
+      Dose_3 = case_when( RT_dosage < 60 ~ "1",
+            RT_dosage == 60 ~ "2",
+           RT_dosage > 60 ~ "3"),
+      Frac_3 = case_when( RT_fraction < 30 ~ "1",
+           RT_fraction == 30 ~ "2",
+           RT_fraction > 30 ~ "3"),
+      Sex = factor(Sex, levels = c("Male", "Female"))) %>%
+    filter(BBID != "11940") %>%
+    filter( RT_group == "Radical")  # only radical group
+  }
+imputed_datasets_bs <- list()
+for (i in 1:m) {
+  imputed_datasets_bs[[i]] <- imputed_datasets[[i]] %>% filter(Status == "Baseline") # create bs imputed data
+}
+
+library(lme4)
+library(mitools)
+
+# Fit mixed-effects models for each imputed dataset
+#radical
+models <- lapply(imputed_datasets, function(data) {
+  lmer(
+    log(telomere) ~ Status + Age + Sex + Smoking_ever + V20 + Dose_3 + Frac_3 + Chemorad + Neutro_perc_scaled + Lympho_perc_scaled + tel_batch + (1 | BBID),
+    data = data[data$CancerStage_combined=="Metastatic",]
+  )
+})
+#SBRT
+models <- lapply(imputed_datasets, function(data) {
+  lmer(
+    log(telomere) ~ Status + Age + Sex + Smoking_ever + RT_dosage + RT_fraction + V20 + Neutro_perc + Lympho_perc + tel_batch + (1 | BBID),
+    data = data
+  )
+})
+
+# Combine estimates using MIcombine
+combined_results <- MIcombine(lapply(models, fixef), lapply(models, function(model) as.matrix(vcov(model))))
+
+summary(combined_results)
+
+# glm
+glm_models <- lapply(imputed_datasets_bs, function(data) {
+  glm(
+    log(telomere) ~ Age_scaled + Sex + Smoking + CancerStage + Rad_prior+ Prior_chemo+ Prior_immuno+ Prior_targeted+ Neutro_perc_scaled + Lympho_perc_scaled + tel_batch,
+    data = data,
+    family = gaussian()
+  )
+})
+# Combine GLM estimates using MIcombine
+glm_combined_results <- MIcombine(lapply(glm_models, coef), lapply(glm_models, function(model) vcov(model)))
+summary(glm_combined_results)
+
+```
+
+
+```{r lmer-cbc}
+# CBC change
+data <- dat3[dat3$Status != "During" & dat3$RT_group=="Radical"
+             ,]
+adj_vars <- c("Age", "Sex", "Smoking", "CancerStage_combined", "RT_dosage", "RT_fraction", "Chemorad", "V20")
+
+loop_lmer(var_outcome = c("WBC","Lymphocytes_perc","Neutrophils_perc","Lymphocytes_abs","Neutrophils_abs",
+                          "Monocytes_abs","Monocytes_perc","Eosinophils_abs","Eosinophils_perc","Basophils_abs","Basophils_perc"), 
+          data = data, additional_covariates =NULL)
+
+corr.test(data[data$Status=="Post",c("telomere")], data[data$Status=="Post",c("WBC","Lymphocytes_perc","Neutrophils_perc","Lymphocytes_abs","Neutrophils_abs",
+                          "Monocytes_abs","Monocytes_perc","Eosinophils_abs","Eosinophils_perc","Basophils_abs","Basophils_perc")], method = "spearman")$r
+
+corr.test(dat4[,c("telomere_Baseline")], 
+          dat4[,c("WBC_diff","Lymphocytes_perc_diff","Neutrophils_perc_diff",
+            "Monocytes_perc_diff","Eosinophils_perc_diff","Basophils_perc_diff")], method = "spearman")
+```
+
+
+```{r explore-density-plot}
+# make a density plot of V20 in dat4 grouped and colored by RT_group
+ggplot(data, aes(x = V20, fill = CancerStage_combined)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "V20 distribution by 2-level cancer stage", x = "V20 (%)", y = "Density") +
+  
+  theme_minimal() +
+  theme(legend.title = element_blank())
+```
+
+
+### Visualization
+
+#### Observed changes
+
+```{r observed}
+# observed telomere length & lymphocytes counts
+
+#long_resting <- generate_long_resting(dat3[dat3$RT_group=="Radical",], "Lymphocytes_perc")
+long_resting <- generate_long_resting_ratio(dat3[dat3$RT_group=="Radical",], "telomere")
+
+dat_plot <- long_resting %>% filter(!is.na(change))
+
+p <- ggplot(dat_plot, aes(x = Status, y = value, group = BBID)) + # y is value so not scaled to 1 at baseline
+  geom_line(aes(col = change), show.legend = F, alpha = 0.6) +
+  geom_point(aes(fill = change), size = 2, alpha = 0.6, shape=21) +
+  scale_color_gradient2(low = "blue", mid = "#F3F3E0", high = "red", midpoint = 1,
+                        limits = c(min(dat_plot$change), max(dat_plot$change))) +
+  scale_fill_gradient2(low = "blue", mid = "#F3F3E0", high = "red", midpoint = 1,
+                       limits = c(min(dat_plot$change), max(dat_plot$change))) +
+  plot.format + theme(legend.position = "none") +
+  labs(x = "", y = "Lymphocyte count (1000 cells/μl)") 
+p
+ggsave(paste0(path_figure,"telomere_change_observed.svg"), p, width = 2, height = 3, dpi = 300)
+#ggsave(paste0(path_figure,"lymph_change_observed.svg"), p, width = 2, height = 3, dpi = 300)
+
+x_var = "PostMonth_group"
+p<- ggplot(dat_plot[dat_plot$PostMonth_group!="-",], aes_string(x = x_var, y = "change")) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "gray50") + 
+    #geom_boxplot(alpha = 0.3) +
+    geom_jitter(aes_string(fill = "change"), width = 0.3, alpha = 0.8, size = 2, shape=21 ) +
+    stat_summary(fun = mean, geom = "crossbar", width = 0.4, linewidth = 0.3, alpha = 0.4) + #"#343131"
+    stat_summary(fun.data = mean_cl_normal, geom = "errorbar", width = 0.3,  alpha=0.6) +  
+    scale_color_gradient2(low = "blue", mid = "#F3F3E0", high = "red", midpoint = 1, limits = c(0.6, 1.4) ) + 
+      scale_fill_gradient2(low = "blue", mid = "#F3F3E0", high = "red", midpoint = 1, limits = c(0.6, 1.4)) + 
+    scale_y_continuous(labels = number_format(accuracy = 0.01)) +
+    labs(y = "Relative change in telomere length") +
+    plot.format + theme(legend.position = "none") 
+ggsave(paste0(path_figure,"telomere_change_observed_months_group.svg"), p, width = 4, height = 2, dpi = 300)
+```
+
+
+#### Predicted changes
+
+```{r predicted paired}
+# obtain predicted telomere adjusting for other covariates 
+# subset the data to only observations with full info on the outcome and covariates
+dat3_complete <- dat3 %>% filter(!is.na(telomere) & !is.na(Age) & !is.na(Sex) & !is.na(Smoking) & RT_group=="Radical" & !is.na(Neutrophils_perc) & !is.na(Lymphocytes_perc) & !is.na(tel_batch)) %>% 
+  dplyr::select(BBID, Status, Age, Sex, Smoking, RT_dosage, RT_fraction, Chemorad, V20, PostMonth_group, Neutrophils_perc, Lymphocytes_perc, tel_batch, telomere)
+
+# alter predictor: Status vs PostMonth_group for different plots                                                     
+mod_tl_status <- lmer(log(telomere) ~ PostMonth_group + Age + Sex + Smoking + Chemorad + V20 + RT_dosage + RT_fraction +
+                      Neutrophils_perc + Lymphocytes_perc + tel_batch +
+                      (1 | BBID), data = dat3_complete)
+
+dat3_complete$predicted_telomere <- exp(predict(mod_tl_status, newdata = dat3_complete, re.form = NULL))
+
+dat_change <- dat3_complete %>%
+  group_by(BBID) %>%  arrange(Status) %>%
+  mutate( telomere_change = predicted_telomere / first(predicted_telomere),
+    color_line = ifelse(Status == "Baseline", last(telomere_change), telomere_change),
+    tel_change_bs_null = ifelse(Status == "Baseline", NA, telomere_change), 
+    tel_change_observed = telomere / first(telomere), 
+    tel_change_observed = ifelse(Status == "Baseline", NA, tel_change_observed))
+
+# connected line to compare pre vs post Status
+x_var = "PostMonth_group"
+
+p<-ggplot(dat_change[dat_change$PostMonth_group!="-",], aes_string(x = x_var, y = "telomere_change")) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "gray50") + 
+    #geom_boxplot(alpha = 0.3) +
+    geom_jitter(aes_string(fill = "telomere_change"), width = 0.3, alpha = 0.8, size = 2, shape=21 ) +
+    stat_summary(fun = mean, geom = "crossbar", width = 0.4, linewidth = 0.3, alpha = 0.4) + #"#343131"
+    stat_summary(fun.data = mean_cl_normal, geom = "errorbar", width = 0.3,  alpha=0.6) +  
+    scale_color_gradient2(low = "blue", mid = "#F3F3E0", high = "red", midpoint = 1, limits = c(0.85, 1.15) ) + 
+      scale_fill_gradient2(low = "blue", mid = "#F3F3E0", high = "red", midpoint = 1, limits = c(0.85, 1.15)) + 
+    scale_y_continuous(labels = number_format(accuracy = 0.01)) +
+    labs(y = "Relative change in telomere length") +
+    plot.format + theme(legend.position = "none") 
+p
+ggsave(paste0(path_figure,"telomere_change_adjusted.svg"), p, width = 4, height = 2, dpi = 300)
+```
+
+```{r}
+# visualize effect of RT on CBC 
+# Load necessary libraries
+library(ComplexHeatmap)
+library(circlize)
+
+# Data 1: input the RT effect into a df
+data <- data.frame(
+  CellType = c("Lymphocytes", "Neutrophils", "Monocytes", "Eosinophils", "Basophils"),
+  Abs = c(-0.625, 0.210, 0.063, 0.004, -0.010),
+  Perc = c(-6.505, 3.996, 2.272, 0.397, 0.015)
+)
+rownames(data) <- data$CellType
+data <- data[, c("Abs", "Perc")]
+
+# Normalize columns independently (absolute scaling for color consistency)
+normalize <- function(x) (x - min(x)) / (max(x) - min(x))
+data_scaled <- apply(data, 2, function(col) sign(col) * normalize(abs(col)))
+
+# Transpose the data
+data_scaled_t <- t(data_scaled)
+
+# Define the new color scale: Blue-White-Orange
+col_fun <- colorRamp2(c(-1, 0, 1), c("blue", "white", "red"))
+
+svg(paste0(path_figure,"heatmap_RT-CBC.svg"), width = 5, height = 1.5)  # Define the file name and dimensions
+
+# Create the heatmap with numeric values for the first two rows
+Heatmap(
+  data_scaled_t,
+  name = "Value",
+  row_names_side = "left",  
+  column_names_side = "top", 
+  row_names_gp = gpar(fontsize = 10),
+  column_names_gp = gpar(fontsize = 10),
+  cluster_rows = FALSE,  # Keep the order of original columns
+  cluster_columns = FALSE,  # Keep the order of original rows
+  col = col_fun,  column_names_rot = 45,
+  rect_gp = gpar(col = "grey", lwd = 0.5),  # Add grey borders with specified line width
+  heatmap_legend_param = list(
+    title = "Value",
+    legend_direction = "horizontal",
+    legend_width = unit(5, "cm")
+  )
+)
+dev.off()
+
+# Data 2: make correlation between telomere and CBC at baseline and post
+data <- dat3[dat3$Status != "During" & dat3$RT_group=="Radical",]
+
+cor_bs <- corr.test(data[data$Status=="Baseline",c("telomere")], 
+          data[data$Status=="Baseline",c("WBC","Lymphocytes_perc","Neutrophils_perc",
+               "Monocytes_perc","Eosinophils_perc","Basophils_perc")], method = "spearman")
+cor_post <- corr.test(data[data$Status=="Post",c("telomere")], 
+          data[data$Status=="Post",c("WBC","Lymphocytes_perc","Neutrophils_perc",
+               "Monocytes_perc","Eosinophils_perc","Basophils_perc")], method = "spearman")
+data <- data.frame(
+  CellType = c("WBC", "Lymphocytes", "Neutrophils", "Monocytes", "Eosinophils", "Basophils"),
+  Baseline = c(cor_bs$r),
+  Post = c(cor_post$r)
+)
+rownames(data) <- data$CellType
+data <- data[, c("Baseline", "Post")]
+col_fun <- colorRamp2(c(-1, 0, 1), c("lightblue", "white", "orange"))
+svg(paste0(path_figure,"heatmap_TL-CBC.svg"), width = 5, height = 1.5)  # Define the file name and dimensions
+Heatmap(
+  t(data),
+  name = "Value",
+  row_names_side = "left",  
+  column_names_side = "top", 
+  row_names_gp = gpar(fontsize = 10),
+  column_names_gp = gpar(fontsize = 10),
+  cluster_rows = FALSE,  # Keep the order of original columns
+  cluster_columns = FALSE,  # Keep the order of original rows
+  col = col_fun,  column_names_rot = 45,
+  rect_gp = gpar(col = "grey", lwd = 0.5),  # Add grey borders with specified line width
+  heatmap_legend_param = list(
+    title = "Value",
+    legend_direction = "horizontal",
+    legend_width = unit(5, "cm")
+  )
+)
+dev.off()
+```
+
+#### Forest Plot
+
+```{r}
+mod_change <- readxl::read_excel("Forest_plot_input_v1.xlsx", sheet = "change")
+
+mod_change <- mod_change %>% mutate(
+  labeltext = factor(labeltext, levels = rev(unique(mod_change$labeltext))), 
+  model = factor(model, levels = c("crude", "adjusted","imputed")))
+
+p<- ggplot(mod_change, aes(x = labeltext, y = mean, ymin = lower, ymax = upper, color = model)) +
+ # geom_pointrange(size = 0.8, alpha=0.8) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.3, size = 0.6, alpha = 1) + 
+  geom_point(size = 2.5, alpha = 0.8) +  # Separate control for point size
+  geom_hline(yintercept = 1, linetype = "dashed", color = "black", alpha=0.6) +  # Null line at 1
+  coord_flip() + scale_y_continuous(limits = c(0.85, 1.3)) + # Adjust x-axis limits and breaks
+  labs(x="Variables", y = "Radiotherapy associated TL change" ) +
+  scale_color_manual( values = c("crude" = '#5B7DAF', "adjusted" = "#6E9C82", "imputed" = '#6A4C93'), name = "Model" ) +
+  facet_wrap(~ model, scales = "free_x") +  # Separate panels for crude and adjusted
+  plot.format + theme(legend.position = "none",   panel.spacing = unit(1, "lines")  )
+
+ggsave(paste0(path_figure,"Change_forestplot.svg"), p, width = 8, height = 4, dpi = 300)
+
+```
+
+
+### Tertile analysis
+
+```{r}
+# split the data into tertiles based on baseline TL 
+data <- dat4[dat4$RT_group == "Radical",] 
+summary(data$telomere_Baseline)
+ quantile(data$telomere_Baseline, probs = c(1/3, 2/3), na.rm = TRUE)
+
+cutoff_1 <- 1.108468    
+cutoff_2 <- 1.211946   
+ 
+id_group1 <- data %>% 
+  filter(telomere_Baseline < cutoff_1) %>% 
+  pull(BBID) %>% 
+  unique()
+temp_lowTL <- dat3 %>% filter(BBID %in% id_group1)
+
+id_group2 <- data %>% 
+  filter(telomere_Baseline >= cutoff_2) %>% 
+  pull(BBID) %>% 
+  unique()
+temp_highTL <- dat3 %>% filter(BBID %in% id_group2)
+
+id_group3 <- data %>% 
+  filter(telomere_Baseline >= cutoff_1 &telomere_Baseline < cutoff_2 ) %>% 
+  pull(BBID) %>% 
+  unique()
+temp_midTL <- dat3 %>% filter(BBID %in% id_group3)
+```
+
+```{r}
+summary( lmer( log(telomere) ~ Status + (1|BBID), data = temp_highTL) )
+summary( lmer( log(telomere) ~ Status + (1|BBID), data = temp_lowTL) )
+summary( lmer( log(telomere) ~ Status + (1|BBID), data = temp_midTL) )
+summary( lmer( log(telomere) ~ Status + (1|BBID), data = dat3) )
+summary( glm(telomere_diff ~ telomere_Baseline, data=dat4))
+```
+
+```{r}
+long_resting <- generate_long_resting_ratio(temp_lowTL, "telomere")
+
+dat_plot <- long_resting %>% filter(!is.na(change))
+
+p <- ggplot(dat_plot, aes(x = Status, y = plot_change, group = BBID)) + # y is value so not scaled to 1 at baseline
+  geom_line(aes(col = change), show.legend = F, alpha = 0.6) +
+  geom_point(aes(col = change), size = 1.5, alpha = 0.6) +
+  scale_color_gradient2(low = "blue", mid = "#F3F3E0", high = "red", midpoint = 1,
+                        limits = c(min(dat_plot$change), max(dat_plot$change))) +
+  scale_fill_gradient2(low = "blue", mid = "#F3F3E0", high = "red", midpoint = 1,
+                       limits = c(min(dat_plot$change), max(dat_plot$change))) +
+  scale_y_continuous(limits = c(0.8, 1.2)) +
+  plot.format + theme(legend.position = "none") +
+  labs(x = "", y = "") 
+p
+ggsave(paste0(path_figure,"telomere_change_observed_low.svg"), p, width = 2, height = 1 , dpi = 300)
+```
+
+
+```{r}
+##############################################################################
+# Simulating Post-therapy data under a joint log-normal model
+##############################################################################
+
+# 0. Load required package
+library(MASS)
+set.seed(123)
+# 1. Read and prepare data
+
+# Simple median imputation for missing values
+data$telomere_Baseline[is.na(data$telomere_Baseline)] <- 
+  median(data$telomere_Baseline, na.rm = TRUE)
+data$telomere_Post[is.na(data$telomere_Post)] <- 
+  median(data$telomere_Post, na.rm = TRUE)
+
+# 2. Log transform (to reduce skewness)
+data$logBase <- log(data$telomere_Baseline)
+data$logPost <- log(data$telomere_Post)
+
+# 3. Estimate parameters from the real data
+muB <- mean(data$logBase)
+muP <- mean(data$logPost)
+sdB <- sd(data$logBase)
+sdP <- sd(data$logPost)
+N <- nrow(data)
+
+# 4. Estimate reliability from correlation with FlowFish
+FlowFISH <- read_excel("Data/Telomere QC/FlowFISH.xlsx")
+r_B = cor.test(FlowFISH$std_FISH_ratio, FlowFISH$std_PCR_ratio, method = "spearman")$estimate
+rho <- cor(data$logBase, data$logPost)/r_B
+
+# 4. Define the means and covariance matrix.
+#    Assume the same distribution as observed.
+mu_vec <- c(muB, muP)  # Means on log scale
+Sigma_mat <- matrix(c(sdB^2,       rho*sdB*sdP,
+                     rho*sdB*sdP, sdP^2     ), 
+                     nrow=2, byrow=TRUE)
+
+# 5. Compare to real data.
+observed_tertiles <- cut(data$telomere_Baseline, 
+                         breaks = quantile(data$telomere_Baseline, probs = c(0, 1/3, 2/3, 1)),
+                         include.lowest = TRUE,
+                         labels = c("Low", "Middle", "High"))
+obs_pc <- (data$telomere_Post/data$telomere_Baseline) - 1
+obs_tl_changes <- tapply(obs_pc, observed_tertiles, mean)
+
+# 8. Repeat for many simulations and compare distribution
+nSim <- 10000  # number of simulated datasets
+sim_tl_changes <- matrix(NA, nrow = nSim, ncol = 3)
+for (s in 1:nSim) {
+  sim_data_s <- mvrnorm(n = N, mu = mu_vec, Sigma = Sigma_mat)
+  sim_Baseline_s <- exp(sim_data_s[,1])
+  sim_Post_s     <- exp(sim_data_s[,2])
+  sim_tertiles <- cut(sim_Baseline_s, 
+                         breaks = quantile(sim_Baseline_s, probs = c(0, 1/3, 2/3, 1)),
+                         include.lowest = TRUE,
+                         labels = c("Low", "Middle", "High"))
+  sim_pc <- (sim_Post_s / sim_Baseline_s) - 1
+
+  sim_tl_changes[s, ] <- tapply(sim_pc, sim_tertiles, mean)
+  colnames(sim_tl_changes) <- c("Low", "Middle", "High")
+}
+
+# We can see how 'extreme' the observed correlation is relative to the simulated distribution:
+cat("Approx p-value for low tertile:", mean(sim_tl_changes[,1] >= obs_tl_changes[1]), "\n")
+cat("Approx p-value for mid tertile:", mean(sim_tl_changes[,2] <= obs_tl_changes[2]), "\n")
+cat("Approx p-value for high tertile:", mean(sim_tl_changes[,3] <= obs_tl_changes[3]), "\n")
+
+```
+
+```{r}
+# Visualize the simulation results
+df_simulated_tl_changes <- data.frame(Low = sim_tl_changes[, "Low"]*100,
+                                   Middle = sim_tl_changes[, "Middle"]*100,
+                                   High = sim_tl_changes[, "High"]*100) 
+summary(df_simulated_tl_changes)
+
+p<- ggplot(df_simulated_tl_changes, aes(x = Low)) +
+  geom_density(fill = "grey", alpha = 0.5) +  # Density of permuted changes
+  geom_vline(xintercept = obs_tl_changes["Low"]*100, color = "red", linetype = "dashed", size = 1) + 
+  scale_x_continuous(limits = c(-8, 3), ) +
+  coord_flip() +
+  labs(title = "", x = "", y = "") + plot.format
+ggsave(paste0(path_figure,"telomere_change_simulated_low.svg"), p, width = 1.8, height = 1.6, dpi = 300)
+```
+
+
+
+## Pre-RT TL predicts post-RT change
+
+```{r}
+library(tableone)
+# use dat4 diff variable to classify patients and explore contribution factors 
+data <- dat4[dat4$RT_group == "Radical",] # only radical group
+
+data$tel_dec <- ifelse(data$telomere_diff < 0, 1, 0)
+
+CreateTableOne(vars = table1_vars, strata= "tel_dec", data = data, factorVars = table1_cat_vars)
+CreateTableOne(vars = c("telomere_Baseline", "telomere_Post"), 
+               strata= "tel_dec", data = data, factorVars = "tel_dec")
+
+summary( glm( tel_dec ~ scale(telomere_Baseline), data = data, family = "binomial") )
+
+```
+
+
+```{r}
+## Data prep from MI 
+v20$BBID <- as.integer(v20$BBID)
+data <- readRDS(paste0(path_data, "4.FMHCR_wide_n100_imp.rds")) %>% 
+  left_join(v20[, c("BBID", "V20")], by = "BBID") %>%
+  filter(RT_group == "Radical") %>% # only radical group
+  mutate(tel_dec = ifelse(telomere_diff < 0, 1, 0), 
+         Age_scaled = as.numeric(scale(Age)),
+         v20_scaled = as.numeric(scale(V20)),
+         telomere_scaled_Baseline = as.numeric(scale(telomere_Baseline)),
+         Neutro_perc_scaled_Baseline = as.numeric(scale(Lymphocytes_perc_Baseline)),
+         Lympho_perc_scaled_Baseline = as.numeric(scale(Neutrophils_perc_Baseline)), 
+         Sex = as.integer(Sex),
+         Chemorad = as.integer(Chemorad),
+         Smoking_ever = ifelse(Smoking == "Never", 0, 1), 
+         CancerStage_combined = ifelse(CancerStage %in% c("Oligomet","Widely met"), 1, 0)
+           ) %>%
+  select(tel_dec, telomere_scaled_Baseline, Age_scaled, v20_scaled, 
+         Neutro_perc_scaled_Baseline, Lympho_perc_scaled_Baseline, 
+         Sex, Smoking_ever, Chemorad, CancerStage_combined
+         )
+data_list <- list(data)
+# use the imputed_datasets containing comprehensive demo and CBC 
+# extract only needed variables and convert to wide format - use defined function for simplicity
+#colnames(imputed_datasets[[1]])
+set.seed(123)
+imp_temp <- process_data_list(
+  data_list = imputed_datasets,
+  id_var = "BBID",
+  status_var = "Status",
+  wide_vars = c("telomere","Neutro_perc_scaled", "Lympho_perc_scaled"),      # Variables to convert to wide format
+  unchanged_vars = c("Age_scaled","Sex","Smoking_ever","V20","CancerStage_combined",
+                     "RT_group","RT_fraction","RT_dosage","Chemorad","Rad_prior")  # Variables to keep unchanged
+)
+
+ml_data_list <- process_ls_and_impute(
+  data_list = imp_temp,
+  scale_vars = c("telomere_Baseline","RT_fraction","RT_dosage", "V20"),
+  categorical_vars = c("Sex","Smoking_ever","Chemorad","CancerStage_combined","Rad_prior"),
+  remove_vars = c("BBID","Neutro_perc_scaled_Post","Lympho_perc_scaled_Post","telomere_Post",
+                  "RT_dosage","RT_fraction","Rad_prior","Radical","SBRT",
+                  "NLR_Baseline", "NLR_Post","NLR_diff",#"Neutro_perc_scaled_Baseline","Lympho_perc_scaled_Baseline",
+                  "telomere_diff") # change to tel_dec 
+)
+
+summary(ml_data_list[[1]])
+summary(data_list[[1]])
+# the generated ml_data_list cotains mutliple imputed datasets with the all variables converted to ML suitable format
+# continous: scaled; categorical: converted to dummy in numeric format 
+cor(ml_data_list[[1]])
+```
+
+
+### Categorize change by ML
+
+#### XGBoost and SHAP
+
+```{r}
+combine_shap_values <- function(shap_values) {
+  # ── packages ────────────────────────────────────────────────────────────────
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+
+  # helper: turn one shapviz object into long tibble ---------------------------
+  sv_long <- function(sv, df_id, fold_id) {
+    if (is.null(sv$S))
+      return(NULL)
+
+    as_tibble(sv$S) |>
+      mutate(.row_id = row_number()) |>               # keeps observations unique
+      pivot_longer(-.row_id,
+                   names_to  = "Feature",
+                   values_to = "SHAP_Value") |>
+      mutate(DataFrame = paste0("DataFrame_", df_id),
+             Fold      = paste0("Fold_",      fold_id),
+             .before = 1)                       # nicer column order
+  }
+
+  # outer list = multiply-imputed data sets ------------------------------------
+  long_all <- imap_dfr(shap_values, function(fold_list, i_df) {
+
+    # inner list = CV folds ----------------------------------------------------
+    imap_dfr(fold_list, ~ sv_long(.x, df_id = i_df, fold_id = .y))
+  })
+
+  if (nrow(long_all) == 0)
+    stop("No SHAP values could be extracted – check the upstream objects.")
+
+  long_all
+}
+```
+
+```{r}
+# Call the function for binary outcome
+results <- xgb_iter_mi_list(
+  data_list = data_list,
+  outcome_name = "tel_dec",
+  outcome_type = "binary",
+  cv_folds = 5,
+  cv_repeats = 3
+)
+# View Final Variable Importance
+print(results$importance) 
+
+# Visualize SHAP for the Last Dataset
+for (sv in results$shap_values[[length(results$shap_values)]]) {
+  print(sv_importance(sv, kind = "bar"))
+  print(sv_importance(sv, kind = "bee"))
+}
+
+#combined_shap <- aggregate_shap_values(results$shap_values)
+shap_long <- combine_shap_values(results$shap_values)
+
+# Bee Swarm Plot: Add Color Gradient
+p<- ggplot(combined_shap, aes(x = reorder(Feature, -SHAP_Value, FUN = mean), y = SHAP_Value, color = SHAP_Value)) +
+  geom_jitter(width = 0.15, height = 0, alpha = 0.6, size = 1.2) +
+  scale_color_viridis(option="plasma") +
+  theme_minimal() +
+  coord_flip() +
+  labs(
+    title = "SHAP (XGBoost)",
+    x = "Feature",
+    y = "SHAP Value"
+  ) + plot.format
+ggsave(paste0(path_figure,"TL_Dec_SHAP_XGBoost.svg"), p, width = 6, height = 4, dpi = 300)
+
+# Bar Plot: Highlight Mean SHAP Values
+bar_data <- combined_shap %>%
+  group_by(Feature) %>%
+  summarize(MeanSHAP = mean(SHAP_Value, na.rm = TRUE)) %>%
+  arrange(desc(MeanSHAP))
+
+ggplot(bar_data, aes(x = reorder(Feature, -MeanSHAP), y = MeanSHAP, fill = MeanSHAP)) +
+  geom_bar(stat = "identity", width = 0.7, color = "black", alpha = 0.9) +
+  scale_fill_viridis(option="plasma") +
+  theme_minimal() +
+  coord_flip() +
+  labs(
+    title = "SHAP Bar Plot",
+    x = "Feature",
+    y = "Mean SHAP Value"
+  ) + plot.format
+
+```
+
+```{r}
+library(ggplot2)
+library(ggbeeswarm)   # geom_quasirandom()
+
+# sort features by global |SHAP| mean, like in original SHAP paper
+feature_order <-
+  shap_long |>
+  group_by(Feature) |>
+  summarise(mean_abs = mean(abs(SHAP_Value))) |>
+  arrange(desc(mean_abs)) |>
+  pull(Feature)
+
+p<- shap_long |>
+  mutate(Feature = factor(Feature, levels = rev(feature_order))) |>
+  ggplot(aes(x = SHAP_Value,
+             y = Feature,
+             colour = SHAP_Value)) +
+  geom_quasirandom(alpha = .6, groupOnX = FALSE, varwidth = .4) +
+  scale_colour_viridis_c(option = "plasma") +
+  labs(x = "SHAP (XGBoost)",
+       y = NULL,
+       colour = "SHAP\nvalue",
+       title = "") +
+  plot.format
+ggsave(paste0(path_figure,"TL_Dec_SHAP_XGBoost_bee.svg"), p, width = 6, height = 4, dpi = 300)
+```
+
+
+
+#### RF and importance
+
+```{r}
+# RF
+results_rf <- rf_iter_mi_list(
+  data_list = data_list,
+  outcome_name = "tel_dec",
+  outcome_type = "binary",
+  cv_folds = 5,
+  cv_repeats = 3
+)
+
+print(results_rf$importance)
+
+p<- ggplot(results_rf$importance, aes(x = reorder(Feature, MeanDecreaseAccuracyAcrossDF), y = MeanDecreaseAccuracyAcrossDF)) +
+  geom_bar(stat = "identity", fill = "grey50", alpha = 0.8) +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "",
+    x = "Feature",
+    y = "Importance (RF)"
+  )+ plot.format
+ggsave(paste0(path_figure,"TL_Dec_RF_importance.svg"), p, width = 4.8, height = 4, dpi = 300)
+```
+
+
+
+
+## Outcome
+
+### PROMS
+
+```{r}
+data <- readRDS(paste0(path_data, "4.FMHCR_wide_n100_imp.rds")) %>% 
+  left_join(v20[, c("BBID", "V20")], by = "BBID") %>%
+  filter(RT_group == "Radical") 
+```
+
+#### Visualize Density
+
+```{r}
+# make density plot by outcomes 
+x_vars <- c("telomere_Baseline", "telomere_Post", "telomere_diff")
+x_labels <- c(
+  "Pre-RT TL",
+  "Post-RT TL",
+  "RT-Change in TL"
+)
+
+# create a binary indicator of mod-severe symptoms
+data$skin_bin <- factor(ifelse(data$skin_score > 2, 1, 0), levels = c(1, 0), labels = c("Mod-Severe", "None-Mild"))
+data$swallow_bin <- factor(ifelse(data$swallow_score > 2, 1, 0), levels = c(1, 0), labels = c("Mod-Severe", "None-Mild"))
+data$lc13_bin <- factor(ifelse(data$lc13_score > 2, 1, 0), levels = c(1, 0), labels = c("Mod-Severe", "None-Mild"))
+data$pneu_dx <- factor(data$pneu_dx_bin, levels = c("1", "0"))
+
+p<- create_histogram_plots(
+  data = data,
+  x_vars = x_vars,
+  fill_var = "pneu_dx", #change different outcomes here
+  x_labels = x_labels,
+  ncol = 3, binwidth = 0.02,
+  col = c( "#903030FF","#787878FF")
+)
+ggsave(paste0(path_figure,"telomere_density_pneu.svg"), p, width = 7, height = 3.5, dpi = 300)
+
+data$tel_dec <- factor(ifelse(data$telomere_diff < 0, 1, 0), levels = c(1, 0), labels = c("Dec", "Inc"))
+
+p<- create_histogram_plots(
+  data = data,
+  x_vars = x_vars,
+  fill_var = "tel_dec", #change different outcomes here
+  x_labels = x_labels,
+  ncol = 3, binwidth = 0.02
+)
+p
+ggsave(paste0(path_figure,"telomere_density_dec.svg"), p, width = 7, height = 3.5, dpi = 300)
+
+```
+
+#### Regression
+
+```{r}
+summary(glm (skin_bin ~ telomere_Baseline + telomere_Post +  Rad_prior , family= "binomial" , data=data))
+summary(glm (swallow_bin ~ telomere_Baseline + telomere_Post + Rad_prior , family= "binomial" , data=data))
+summary(glm (lc13_bin ~ telomere_Baseline + telomere_Post + Rad_prior, family= "binomial" , data=data))
+summary(glm (lc13_bin ~ telomere_diff , family= "binomial" , data=data))
+
+summary(glm (telomere_diff ~ lc13_bin + Rad_prior, data=data))
+summary(glm (telomere_diff ~ pneu_dx + Rad_prior, data=data))
+
+summary(glm (telomere_Post ~ telomere_Baseline + Age + Smoking ,  data=data))
+summary(glm (telomere_diff ~ telomere_Baseline + Age + Smoking ,  data=data))
+```
+
+
+### RP - ml3
+
+```{r}
+ml_data <- readRDS(paste0(path_data, "4.FMHCR_wide_n100_imp.rds")) %>% 
+  mutate(BBID = as.character(BBID)) %>% # ensure BBID is character for merging)
+  left_join(v20[, c("BBID", "V20")], by = "BBID") %>%
+  filter(RT_group == "Radical" ) %>% # only radical group
+  mutate(
+    skin_bin = ifelse(skin_score > 2, 1, 0),
+    swallow_bin = ifelse(swallow_score > 2, 1, 0),
+    lc13_bin = ifelse(lc13_score > 2, 1, 0), 
+    telomere_diff = telomere_Post - telomere_Baseline,
+    telomere_Baseline = as.numeric(scale(telomere_Baseline)),
+    telomere_Post = as.numeric(scale(telomere_Post)),
+    telomere_diff = as.numeric(scale(telomere_diff)),
+    Lymphocytes_perc_Baseline = as.numeric(scale(Lymphocytes_perc_Baseline)),
+    Lymphocytes_perc_diff = as.numeric(scale(Lymphocytes_perc_diff)),
+    NLR_Baseline = as.numeric(scale(Neutrophils_perc_Baseline / Lymphocytes_perc_Baseline)),
+    NLR_Post = as.numeric(scale(Neutrophils_perc_Post / Lymphocytes_perc_Post)),
+    NLR_diff = as.numeric(scale(NLR_Post - NLR_Baseline)),
+    Age = as.numeric(scale(Age)),
+    RT_dosage = as.numeric(scale(RT_dosage)),
+    RT_fraction = as.numeric(scale(RT_fraction)), 
+    Smoking_ever = ifelse(Smoking == "Never", 0, 1),
+    V20 = as.numeric(scale(V20)),
+    RP_within_6mo = ifelse(pneu_month <= 6 & pneu_dx_bin == 1, 1,
+                         ifelse(pneu_month > 6, 0, NA)) ,  
+    CancerStage_combined = ifelse(CancerStage %in% c("Oligomet", "Widely met"), 1, 0),
+    Radical = ifelse(RT_group == "Radical", 1, 0)
+  ) %>% 
+    dplyr::select(-c(BBID, skin_score, swallow_score, lc13_score #, 
+              #Smoking, CancerStage, RT_group
+              ))  # Remove original outcomes 
+
+ml_data <- ml_data %>% 
+  filter(!is.na(lc13_bin)) %>% 
+  dplyr::select(-c(pneu_dx_bin, swallow_bin, skin_bin)) %>% 
+  mutate(across(everything(), as.numeric)) %>% 
+  mutate(lc13_bin = as.factor(lc13_bin)) %>%
+  as.data.frame()
+ml_data[is.na(ml_data$V20), "V20"] <- median(ml_data[ml_data$Radical==0,]$V20, na.rm=T)  # Replace NA V20 with 0
+```
+
+
+#### Variable selection
+
+```{r 03-05-25-paramset}
+# User-defined parameters
+outcome_var <- "lc13_bin"  # Define outcome variable
+n_boot <- 100 # Number of bootstrap samples
+n_adj_vars <- 6  # Number of adjusted variables to retain in RFE
+
+# Define candidate covariates (selected based on prior knowledge)
+candidate_covariates <-  c("Age", "Sex","Smoking_ever", "CancerStage_combined", "NLR_diff", "Lymphocytes_perc_diff", "RT_dosage", "RT_fraction", "V20", "Rad_prior","Chemorad" #,"Radical"
+                           
+                           )
+
+predictors= c("telomere_Baseline", "telomere_Post", "telomere_diff", candidate_covariates)  # Adjusted variables + telomere predictors
+```
+
+
+```{r 03-05-25-predictor_var_selection}
+## Step 1. Preprocessing for feature selection
+# Load necessary libraries
+library(glmnet)
+library(caret)
+set.seed(1996)
+
+# Ensure the dataset is formatted correctly
+df <- ml_data[, c(outcome_var, predictors)]
+
+# Convert categorical variables to dummy variables
+X <- model.matrix(~ . - 1, data = df[, predictors])  # Create numeric matrix without intercept
+y <- as.numeric(as.factor(df[[outcome_var]])) - 1  # Convert to numeric (0/1)
+
+# Ensure X is a matrix (GLMNET requires matrix input)
+X <- as.matrix(X)
+
+print("Data preprocessing complete.")
+
+
+## Step 2. Feature Selection via Bootstrap + GLMNET
+
+selected_features_list <- list()
+
+# Create stratified bootstrap samples
+boot_samples <- createResample(y, times = n_boot, list = TRUE)
+
+for (i in 1:n_boot) {
+  
+  # Bootstrap sample
+  boot_idx <- boot_samples[[i]]
+  X_boot <- X[boot_idx, ]
+  y_boot <- y[boot_idx]
+
+  # Ensure at least two classes exist
+  if (length(unique(y_boot)) < 2) next  
+
+  nfolds_value <- ifelse(length(unique(y_boot)) < 8, length(y_boot), 10)
+
+  # Fit GLMNET with cross-validation
+  cv_fit_boot <- cv.glmnet(X_boot, y_boot, family = "binomial", alpha = 0.5, 
+                           lambda.min.ratio = 0.005,  # Less aggressive shrinkage
+                           nfolds = nfolds_value, 
+                           grouped = FALSE)
+
+  # Extract nonzero coefficients  
+  coef_matrix_boot <- coef(cv_fit_boot, s = "lambda.min")
+  selected_features_boot <- rownames(coef_matrix_boot)[coef_matrix_boot[, 1] != 0]
+
+  # Store selected features
+  selected_features_list[[i]] <- selected_features_boot
+}
+
+# Count feature selection frequency
+feature_counts <- table(unlist(selected_features_list))
+feature_freq <- as.data.frame(feature_counts)
+colnames(feature_freq) <- c("Feature", "Selection_Frequency")
+
+# Retain features selected in at least 50% of bootstrap runs
+stable_features <- feature_freq$Feature[feature_freq$Selection_Frequency >= (n_boot * 0.5)]
+# remove intercept from stable_feature
+stable_features <- stable_features[!stable_features %in% "(Intercept)"]
+
+if (length(stable_features) == 0) {
+  warning("No stable features selected from Bootstrap + GLMNET. Using original predictors instead.")
+  stable_features <- predictors  # Use the original predictor set
+}
+
+print("Stable Features Selected via Bootstrap + GLMNET:")
+print(stable_features)
+
+```
+
+
+#### Benchmarking with mlr3
+
+```{r}
+# Define predictors and adjusted variables
+predictors <- c("telomere_Baseline", "telomere_Post", "telomere_diff")
+adjusted_vars <- c("Age","Smoking_ever","V20","Rad_prior","Chemorad" ,"RT_dosage" #radical main "NLR_diff",
+                   #, "Radical", "Lymphocytes_perc_diff" , "CancerStage_combined"
+                   )
+adjusted_vars <- c("Smoking_ever","NLR_diff") #c("NLR_diff","Rad_prior")
+adjusted_vars <- c("Age","Smoking_ever","V20","Rad_prior","RT_dosage" #radical main "NLR_diff",
+                   , "Radical", "Lymphocytes_perc_diff" , "NLR_diff"
+                   )
+#ml_data = ml_data[, c(outcome_var, predictors, adjusted_vars)]
+adjusted_vars <- c("Chemorad","V20")
+# check in-framwork selection
+#filter = flt("mim")
+#filter$calculate(task)
+#filter$scores
+
+# null model
+predictors <- c("Age")
+adjusted_vars <- c("Smoking_ever","V20","Rad_prior","Chemorad" ,"RT_dosage" )
+predictors <- c("Smoking_ever")
+adjusted_vars <- c("V20" )
+predictors <- c("Smoking_ever")
+adjusted_vars <- c("V20", "RT_dosage", "Rad_prior")
+predictors <- c("Smoking_ever")
+adjusted_vars <- c("NLR_diff" )
+```
+
+
+```{r 03-05-25-mlr3-benchmark}
+# Load necessary libraries
+library(mlr3)
+library(mlr3learners)
+library(mlr3extralearners)
+library(mlr3pipelines)
+library(mlr3tuning)
+library(mlr3mbo)
+library(mlr3tuningspaces)
+library(future)
+library(ggplot2)
+
+set.seed(1996)
+
+#future::plan(sequential)
+future::plan(multisession, workers = parallel::detectCores() - 2)
+options(future.seed = TRUE)
+lgr::get_logger("bbotk")$set_threshold("warn")
+lgr::get_logger("mlr3")$set_threshold("warn")
+
+# Define the task
+task <- TaskClassif$new(id = outcome_var, backend = ml_data, target = outcome_var)
+task$positive = "1"  # Set the positive class for binary classification
+task$col_roles$stratum <- outcome_var
+
+# Define learners
+learner_methods <- list(
+  "Logistic Regression" = lrn("classif.log_reg", predict_type = "prob"),
+  "KSVM" = lrn("classif.ksvm", predict_type = "prob")
+)
+
+# Helper function to create pipelines and AutoTuner
+create_tuned_learner <- function(method, predictor) {
+  learner <- learner_methods[[method]]
+  
+  # Create pipeline graph with preprocessing
+  graph <- po("fixfactors") %>>%  
+    po("select", selector = selector_name(c(predictor, adjusted_vars))) %>>%
+    po("classbalancing", id = "upsample", adjust = "minor", reference = "major") %>>%
+    po("learner", learner)
+  
+  graph_learner <- as_learner(graph)
+  
+  # Adjust method name for specific cases
+  adjusted_method <- ifelse(tolower(gsub(" ", "", method)) == "randomforest", "ranger", tolower(gsub(" ", "", method)))
+  tuning_space_id <- paste0("classif.", adjusted_method, ".default")
+
+  if (tuning_space_id %in% mlr_tuning_spaces$keys()) {
+    tuning_space <- lts(tuning_space_id)
+
+    for (param in names(tuning_space$values)) {
+      qualified_param <- paste0("classif.", adjusted_method, ".", param)
+      graph_learner$param_set$values[[qualified_param]] <- tuning_space$values[[param]]
+    }
+
+    # AutoTuner with Bayesian Optimization
+    at <- AutoTuner$new(
+      learner = graph_learner,
+      resampling = rsmp("cv", folds = 2),  
+      measure = msr("classif.auc"),  
+      tuner = tnr("mbo"),  
+      terminator = trm("combo",list(
+        trm("stagnation", iters = 5),
+        trm("evals", n_evals = 30))
+        ) 
+      )
+    at$id <- paste(method, predictor, sep = "_")
+    return(at)
+  } else {
+    graph_learner$id <- paste(method, predictor, sep = "_")
+    return(graph_learner)
+  }
+}
+
+# Create a list of tuned learners for each method and predictor
+tuned_learners <- lapply(names(learner_methods), function(method) {
+  lapply(predictors, function(predictor) {
+    create_tuned_learner(method, predictor)
+  })
+})
+names(tuned_learners) <- names(learner_methods)
+
+# Define resampling strategies
+resampling_loocv <- rsmp("loo")
+
+# Define evaluation metrics
+measures <- list(msr("classif.auc"), msr("classif.bbrier"), msr("classif.acc"), msr("classif.logloss"))
+
+# Initialize a list to store benchmark results
+benchmark_results <- list()
+
+for (method in names(tuned_learners)) {
+  learners <- tuned_learners[[method]]
+  learners <- Filter(Negate(is.null), learners)  # Remove NULL learners (skipped due to separation)
+  
+  if (length(learners) == 0) {
+    message(paste("Skipping method:", method, "due to all predictors having separation issues"))
+    next
+  }
+
+  # Define benchmark grid for LOOCV
+  design_loocv <- benchmark_grid(tasks = list(task), learners = learners, resamplings = resampling_loocv)
+
+  # Run benchmark for LOOCV with error handling
+  bmr_loocv <- tryCatch({
+    benchmark(design_loocv)
+  }, error = function(e) {
+    message(paste("Skipping", method, "in LOOCV due to error:", e$message))
+    return(NULL)
+  })
+
+  if (!is.null(bmr_loocv)) {
+    agg_results_loocv <- tryCatch({
+      bmr_loocv$aggregate(measures)
+    }, error = function(e) {
+      message(paste("Skipping aggregation for", method, "in LOOCV due to error:", e$message))
+      return(NULL)
+    })
+  } else {
+    agg_results_loocv <- NULL
+  }
+
+  # Store results 
+  benchmark_results[[method]] <- list( bmr_loocv = bmr_loocv, agg_results_loocv = agg_results_loocv )
+}
+
+```
+
+```{r}
+#saveRDS(benchmark_results, file = paste0(path_data, "Temp_bmr_res_7var.rds"))
+benchmark_results <- readRDS(paste0(path_data, "Temp_bmr_res_7var.rds"))
+```
+
+
+```{r out-of-fold-AUC}
+library(pROC)        # for pooled AUC & CI
+library(data.table)
+
+### helper: pooled AUC + CI -----------------------------------------------
+pooled_auc_ci <- function(pred, ci.method = "delong", conf.level = 0.95) {
+  roc_obj <- roc(response = pred$truth,
+                 predictor = pred$prob[, "1"],
+                 levels   = rev(levels(pred$truth)),   # ensure "1" is positive
+                 quiet    = TRUE)
+  ci_vec <- ci.auc(roc_obj, method = ci.method, conf.level = conf.level)
+  data.table(auc = as.numeric(roc_obj$auc),
+             lower = ci_vec[1],
+             upper = ci_vec[3])
+}
+
+### post-hoc scoring for BOTH resampling schemes ---------------------------
+score_resample <- function(bmr, tag) {
+  rbindlist(lapply(seq_len(bmr$n_resample_results), function(i) {
+    res <- bmr$resample_result(i)
+    pred <- res$prediction()     # pooled predictions
+    tmp  <- pooled_auc_ci(pred)
+    tmp[, learner_id := res$learner$id]
+    tmp[, resampling := tag]
+    tmp
+  }))
+}
+
+### -----------------------------------------------------------
+# after benchmark() calls:
+
+# benchmark_results is the list: $`Logistic Regression`, $GLMNET`, etc.
+method_names <- names(benchmark_results)
+
+# score across methods
+pooled_results_all <- rbindlist(lapply(method_names, function(m) {
+  out_cv  <- if (!is.null(benchmark_results[[m]]$bmr_cv))
+               score_resample(benchmark_results[[m]]$bmr_cv, "repeated_cv")
+             else NULL
+  out_loo <- if (!is.null(benchmark_results[[m]]$bmr_loocv))
+               score_resample(benchmark_results[[m]]$bmr_loocv, "loocv")
+             else NULL
+  rbindlist(list(out_cv, out_loo), use.names = TRUE)[, method := m]
+}), use.names = TRUE)
+
+# view result
+pooled_results_all[]
+
+```
+
+
+#### ROC 
+
+```{r}
+library(future)
+library(future.apply)
+library(pROC)
+library(data.table)
+plan(multisession, workers = parallel::detectCores() - 2) 
+bmr <- benchmark_results[["KSVM"]]$bmr_loocv
+curve_dt <- rbindlist(
+  lapply(seq_len(bmr$n_resample_results), function(i) {
+    res  <- bmr$resample_result(i)
+    pred <- res$prediction()
+
+    id_parts <- strsplit(res$learner$id, "_", fixed = TRUE)[[1]]
+    roc_band_stratified(pred,
+                        learner_id   = id_parts[1],
+                        predictor_tag = id_parts[length(id_parts)])
+  }),
+  use.names = TRUE)
+
+pred_cols <- c(Baseline="#663399", Post="#39568CFF", diff="#1b9e77")
+
+p<- wrap_plots(lapply(unique(curve_dt$learner_id),make_panel),ncol=1)+ plot.format +
+  theme(legend.position = "none") 
+ggsave(paste0(path_figure,"RP_ROC_ksvm_radcomb_noTL.svg"), p, width = 5, height = 3 )
+```
+
+
+
+
+## Relate to FM-HCR
+
+```{r}
+var_us = c('NHEJ', 'LPBER', 'MMR', 'UG', 'oxoGC', 'A8oxoG', 'IR', 'Hx', 'NER')
+var_bs = c("NHEJ_Baseline", "LPBER_Baseline", "MMR_Baseline", "UG_Baseline", "oxoGC_Baseline", "A8oxoG_Baseline", "IR_Baseline", "Hx_Baseline", "NER_Baseline")
+var_post = c("NHEJ_Post", "LPBER_Post", "MMR_Post", "UG_Post", "oxoGC_Post", "A8oxoG_Post", "IR_Post", "Hx_Post", "NER_Post")
+var_diff = c("NHEJ_diff", "LPBER_diff", "MMR_diff", "UG_diff", "oxoGC_diff", "A8oxoG_diff", "IR_diff", "Hx_diff", "NER_diff")
+```
+
+
+### Mediation 
+
+```{r}
+library(lme4)
+
+res <- mediation_lmer_perm(
+  exposure      = "Status",
+  mediator      = "A8oxoG",
+  outcome       = "telomere",
+  covariates_em = c("Age", "Sex", "Smoking_ever","Chemorad","V20"),                         # a-path
+  covariates_y  = c("Age", "Sex", "Smoking_ever","Chemorad","V20","tel_batch"),
+  random_id     = "BBID",
+  data          = data,
+  log_outcome   = T,    # model log-telomere, report multiplicative effects
+  n_perm        = 1000,
+  n_boot        = 500,
+  seed          = 1996
+)
+res
+```
+
+```{r}
+out <- mediation_glm_perm(
+  exposure      = "age_scaled",
+  mediator      = "A8oxoG",
+  outcome       = "telomere",
+  covariates_em = c("Sex", "Smoking", "CancerStage"),  # a-path
+  covariates_y  = c("Sex", "Smoking", "CancerStage","Neutrophils_perc", "Lymphocytes_perc","tel_batch"), # y-path
+  data          = bs,
+  family_out    = gaussian(),  
+  use_bayes     = T,
+  log_outcome   = TRUE,  
+  n_perm        = 1000,
+  n_boot        = 500,
+  seed          = 1996
+)
+out
+```
+
+
+
+## Visualization by scatter plots 
+
+```{r}
+data <- dat3 %>% 
+  filter(RT_group == "Radical") %>% # only radical group
+  mutate(CancerStage_combined= ifelse(CancerStage %in% c("Oligomet", "Widely met"), 1, 0), 
+         Chemorad = as.factor(Chemorad))
+
+library(visreg)
+
+# predicted telomere length as y axis - adjusted for all covaraites 
+
+all_visreg_data <- data.frame()
+for (var in var_us) {
+  # Create the model dynamically using the variable  Chemorad + V20 +
+  formula <- as.formula(paste("log(telomere) ~", var, "+ Status + Age + Sex + Smoking_ever + CancerStage_combined + Chemorad + V20 +
+                              Neutrophils_perc + Lymphocytes_perc + tel_batch"))
+  mod_tl_drc <- glm(formula, data = data)
+  
+  # Visualize the relationship using visreg without plotting
+  visreg_data <- visreg(mod_tl_drc, var, plot = FALSE)
+  
+  # Create a data frame with the partial residuals and add the variable name as an identifier
+  dat_partial <- data.frame(
+    X = visreg_data$res[[var]],
+    partial_residuals = exp(visreg_data$res$visregRes),
+    variable = var
+  )
+  
+  # Append to the full data frame
+  all_visreg_data <- rbind(all_visreg_data, dat_partial)
+}
+all_visreg_data$variable <- factor(all_visreg_data$variable, levels = var_us)
+cor_data <- all_visreg_data %>%
+  group_by(variable) %>%
+  summarize(correlation = cor(X, log(partial_residuals), use = "complete.obs"),
+            p_value = cor.test(X, log(partial_residuals), use = "complete.obs")$p.value) %>% 
+  mutate(p_adj = p.adjust(p_value, method = "BH"))
+all_visreg_data <- left_join(all_visreg_data, cor_data, by = "variable")
+
+p<- ggplot(data = all_visreg_data, aes(x = X, y = partial_residuals, color = X)) +
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), se = TRUE, alpha = 0.2, color = "gray60") +
+  geom_point(alpha = 0.4, size = 2) + 
+  scale_color_viridis(discrete = FALSE, option = "G") +
+  labs(x = "DNA repair capacity (standardized)", y = "Telomere length (ajusted)") +
+  facet_wrap(~ variable, labeller = as_labeller(var_us_labels)) +  
+  #geom_text(aes(x = Inf, y = Inf, label = paste("r =", round(correlation, 3), "\n", "p =", format.pval(p_value, digits = 1))),
+  #          hjust = 1.1, vjust = 1.1, size = 4, color = "black") +
+   geom_text(data = cor_data,
+            aes(label = paste("r =", round(correlation, 3), "\n", "p =", format.pval(p_value, digits = 1))),
+            x = Inf, y = Inf, hjust = 1.1, vjust = 1.1, inherit.aes = FALSE, size = 4, color = "black") +
+  plot.format + theme(legend.position = "none")
+
+ggsave(paste0(path_figure,"FMHCR_adjusted.svg"), p, width = 6, height = 6, dpi = 300)
+
+
+# observed telomere length on the y axis - simple correlation
+dat_plot <- dat3 %>% filter(RT_group == "Radical") %>% 
+  pivot_longer( cols = all_of(var_us),
+                    names_to = "variable",
+                    values_to = "value") %>%
+  mutate(variable = factor(variable, levels = var_us))
+cor_data <- dat_plot %>%
+  group_by(variable) %>%
+  summarize(correlation = cor(value, log(telomere), use = "complete.obs"),
+            p_value = cor.test(value, log(telomere), use = "complete.obs")$p.value)%>% 
+  mutate(p_adj = p.adjust(p_value, method = "BH"))
+dat_plot <- left_join(dat_plot, cor_data, by = "variable")
+
+p<- ggplot(data = dat_plot, aes(x = value, y = telomere, color = value)) +
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), se = TRUE, alpha = 0.2, color = "gray60") +
+  geom_point(alpha = 0.4, size = 2) + 
+  scale_color_viridis(discrete = FALSE, option = "G") +
+  labs(x = "DNA repair capacity (standardized)", y = "Telomere length (T:S ratio)") +
+  facet_wrap(~ variable, labeller = as_labeller(var_us_labels)) +  
+  geom_text(data = cor_data, aes(x = Inf, y = Inf, 
+            label = paste("r =", round(correlation, 3), "\n", "p =", format.pval(p_value, digits = 1))),
+            hjust = 1.1, vjust = 1.1, size = 4, color = "black", inherit.aes = FALSE) +
+  plot.format + theme(legend.position = "none")
+p
+ggsave(paste0(path_figure,"FMHCR_observed.svg"), p, width = 6, height = 6, dpi = 300)
+
+```
+
+
+## Forest plot
+
+```{r}
+data <- dat3 %>% 
+  filter( RT_group == "Radical") %>% # only radical group
+  mutate(CancerStage_combined= ifelse(CancerStage %in% c("Oligomet", "Widely met"), 1, 0), 
+         log_tl = log(telomere)) # combine cancer stage
+
+results <- loop_glm(outcomes = c("log_tl"), predictors = var_us, data = data, all_together = F) %>% # crude
+  mutate( beta = exp(Coefficient),
+  lower = exp(Coefficient - 1.96 * SE),
+  upper = exp(Coefficient + 1.96 * SE) )
+results
+
+results_adj <- loop_glm_adj(outcomes = c("log_tl"), predictors = var_us, data = data, all_together = F, 
+                            additional_covariates = c("Age", "Sex", "Smoking_ever", "CancerStage_combined", "Status", "V20",
+                                                     "Neutrophils_perc", "Lymphocytes_perc","tel_batch" #, "RT_group" "Chemorad", 
+                                                    ) ) %>% 
+  mutate( beta = exp(Coefficient),
+  lower = exp(Coefficient - 1.96 * SE),
+  upper = exp(Coefficient + 1.96 * SE) )
+results_adj
+
+```
+
+
+```{r}
+glm_models <- lapply(imputed_datasets, function(data) {
+  glm(
+    log(telomere) ~ NER + Age + Sex + Smoking_ever + Status + CancerStage_combined + Status + Chemorad + V20 + Neutro_perc_scaled + Lympho_perc_scaled + tel_batch,
+    data = data,
+    family = gaussian()
+  )
+})
+# Combine GLM estimates using MIcombine
+glm_combined_results <- MIcombine(lapply(glm_models, coef), lapply(glm_models, function(model) vcov(model)))
+summary(glm_combined_results)
+```
+
+
+```{r}
+mod_drc <- read_excel("Telomere/Forest_plot_input.xlsx", sheet = "drc")
+
+mod_drc <- mod_drc %>% mutate(
+  labeltext = factor(labeltext, levels = rev(unique(mod_drc$labeltext))), 
+  model = factor(model, levels = c("crude", "adjusted","imputed")))
+
+p<- ggplot(mod_drc, aes(x = labeltext, y = mean, ymin = lower, ymax = upper, color = model)) +
+ # geom_pointrange(size = 0.8, alpha=0.8) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.3, size = 0.6, alpha = 1) + 
+  geom_point(size = 2.5, alpha = 0.8) +  # Separate control for point size
+  geom_hline(yintercept = 1, linetype = "dashed", color = "black", alpha=0.6) +  # Null line at 1
+  coord_flip() + scale_y_continuous(limits = c(0.9,1.1)) +
+  labs(x="Variables", y = "Radiotherapy associated telomere length change (ratio [95%CI])" ) +
+  scale_color_manual( values = c("crude" = '#5B7DAF', "adjusted" = "#6E9C82", "imputed" = '#6A4C93'), name = "Model" ) +
+  facet_wrap(~ model) +  # Separate panels for crude and adjusted
+  plot.format + theme(legend.position = "none",   panel.spacing = unit(1, "lines")  )
+
+ggsave(paste0(path_figure,"DRC_forestplot.svg"), p, width = 8, height = 4, dpi = 300)
+```
+
+
+
+
+
+
+
